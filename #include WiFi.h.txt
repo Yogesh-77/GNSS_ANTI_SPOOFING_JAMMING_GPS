@@ -1,0 +1,301 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <TinyGPSPlus.h>
+#include <ArduinoJson.h>
+#include <math.h>
+#include "gnss_model.h"
+
+/* ================= WIFI CONFIGURATION ================= */
+const char* ssid = "Airtel_YOGI";
+const char* password = "YSM123456789";
+
+/* ================= OBJECTS & MODELS ================= */
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+WebServer server(80);
+Eloquent::ML::Port::RandomForest model;
+
+/* ================= SYSTEM VARIABLES ================= */
+double currentLat = 0, currentLon = 0;
+double lastLat = 0, lastLon = 0;
+double displayLat = 0, displayLon = 0;
+double predictedLat = 0, predictedLon = 0;
+
+float speedKph = 0, satellites = 0, hdopValue = 0;
+float driftMeters = 0, trustScore = 1.0, antiSpoofRisk = 0.0;
+float zAnomalyScore = 0.0, satDropRate = 0.0, speedJump = 0.0, hdopSpike = 0.0;
+
+float lastSpeedKph = 0.0, lastSatellites = 0.0, lastHdopValue = 0.0;
+
+// Statistical Baselines (EWMA)
+float driftMean = 8.0, driftVar = 12.0;
+float hdopMean = 1.2, hdopVar = 0.6;
+float satMean = 9.0, satVar = 2.0;
+
+unsigned long lastFixMs = 0;
+bool safeMode = false, spoofSim = false, jamSim = false, stabilityGateBlocked = false;
+
+// Kalman Filter State
+double kfLat = 0, kfLon = 0, kfVLat = 0, kfVLon = 0;
+bool kalmanInitialized = false;
+
+String aiStatus = "INITIALIZING";
+String spoofReason = "CALIBRATING";
+
+int spoofCounter = 0, heatBurnCounter = 0;
+String lastLoggedAttack = "";
+unsigned long lastAttackLogMs = 0;
+
+// Forensic Logging
+struct AttackLog {
+  unsigned long sec;
+  double lat;
+  double lon;
+  float risk;
+  String attack;
+};
+const int MAX_ATTACK_LOGS = 20;
+AttackLog attackLogs[MAX_ATTACK_LOGS];
+int attackLogCount = 0, attackLogStart = 0;
+
+/* ================= HTML DASHBOARD ================= */
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AirWatch Sentinel v3.0</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.heat@0.2.0/dist/leaflet-heat.js"></script>
+<style>
+:root { --panel: #ffffff; --border: #e2e8f0; --text: #0f172a; --muted: #475569; --good: #16a34a; --warn: #d97706; --bad: #dc2626; }
+body { margin: 0; color: var(--text); font-family: "Inter", sans-serif; background: #f8fafc; }
+.container { width: min(1200px, 95vw); margin: 20px auto; display: grid; gap: 15px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 15px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
+.grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 15px; }
+.status-card { grid-column: span 12; display: flex; justify-content: space-between; align-items: center; }
+.metrics, .controls, .location { grid-column: span 4; }
+.map-card { grid-column: span 8; height: 450px; padding: 0; overflow: hidden; }
+.security-card { grid-column: span 4; }
+#map { width: 100%; height: 100%; }
+.status-pill { padding: 8px 16px; border-radius: 20px; font-weight: 800; border: 1px solid var(--border); }
+.metric-row { display: flex; justify-content: space-between; border-bottom: 1px dashed #e2e8f0; padding: 5px 0; font-size: 0.9rem; }
+button { width: 100%; margin-bottom: 8px; padding: 10px; border-radius: 8px; border: 0; color: #fff; font-weight: 700; cursor: pointer; }
+.btn-spoof { background: #dc2626; } .btn-jam { background: #d97706; } .btn-reset { background: #0284c7; }
+.progress { height: 10px; background: #e2e8f0; border-radius: 5px; margin: 10px 0; overflow: hidden; }
+.progress span { display: block; height: 100%; background: var(--bad); transition: 0.3s; }
+table { width: 100%; font-size: 0.8rem; border-collapse: collapse; }
+th, td { padding: 8px; text-align: left; border-bottom: 1px solid #e2e8f0; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="card status-card">
+    <div><h2 style="margin:0">AirWatch Sentinel v3.0</h2><p style="margin:0; color:var(--muted)">Dual-AI GNSS Protection</p></div>
+    <div class="status-pill" id="statusBox">INITIALIZING</div>
+  </div>
+  <div class="grid">
+    <div class="card metrics">
+      <b>Signal Metrics</b>
+      <div class="metric-row"><span>Sats</span><span id="sat">0</span></div>
+      <div class="metric-row"><span>HDOP</span><span id="hdop">0.0</span></div>
+      <div class="metric-row"><span>Drift</span><span id="drift">0.0m</span></div>
+      <div class="metric-row"><span>Speed</span><span id="speed">0.0</span></div>
+      <div class="metric-row"><span>Trust</span><span id="trust">0%</span></div>
+    </div>
+    <div class="card controls">
+      <b>Simulation</b>
+      <button class="btn-spoof" onclick="fetch('/spoof')">Simulate Spoof</button>
+      <button class="btn-jam" onclick="fetch('/jam')">Simulate Jamming</button>
+      <button class="btn-reset" onclick="fetch('/reset')">Deep Purge</button>
+    </div>
+    <div class="card location">
+      <b>Location</b>
+      <div class="metric-row"><span>Lat</span><span id="lat">0.0</span></div>
+      <div class="metric-row"><span>Lon</span><span id="lon">0.0</span></div>
+      <div class="metric-row"><span>Gate</span><span id="gate">OPEN</span></div>
+    </div>
+    <div class="card map-card"><div id="map"></div></div>
+    <div class="card security-card">
+      <b>Security Intel</b>
+      <div class="progress"><span id="riskBar" style="width:0%"></span></div>
+      <div id="reason" style="font-size:0.8rem; color:var(--muted)">Analyzing...</div>
+    </div>
+    <div class="card" style="grid-column: span 12">
+      <b>Attack Forensics</b>
+      <div style="max-height:150px; overflow:auto">
+        <table><thead><tr><th>Time</th><th>Attack</th><th>Risk</th><th>Coords</th></tr></thead><tbody id="logRows"></tbody></table>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+const map = L.map('map').setView([0,0], 2);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png').addTo(map);
+const marker = L.marker([0,0]).addTo(map);
+const trail = L.polyline([], {color:'#0284c7'}).addTo(map);
+async function update() {
+  const res = await fetch('/status'); const d = await res.json();
+  document.getElementById('sat').innerText = d.sat;
+  document.getElementById('hdop').innerText = d.hdop;
+  document.getElementById('drift').innerText = d.drift.toFixed(1)+'m';
+  document.getElementById('speed').innerText = d.speed.toFixed(1)+'km/h';
+  document.getElementById('trust').innerText = (d.trust*100).toFixed(0)+'%';
+  document.getElementById('lat').innerText = d.lat.toFixed(6);
+  document.getElementById('lon').innerText = d.lon.toFixed(6);
+  document.getElementById('statusBox').innerText = d.status;
+  document.getElementById('riskBar').style.width = (d.risk*100)+'%';
+  document.getElementById('reason').innerText = d.reason;
+  document.getElementById('gate').innerText = d.gate ? 'BLOCKED' : 'OPEN';
+  marker.setLatLng([d.lat, d.lon]); trail.addLatLng([d.lat, d.lon]);
+  if(tick++ % 5 == 0) map.setView([d.lat, d.lon], 16);
+  const lRes = await fetch('/logs'); const lData = await lRes.json();
+  document.getElementById('logRows').innerHTML = lData.logs.map(l => `<tr><td>${l.time}s</td><td>${l.attack}</td><td>${(l.risk*100).toFixed(0)}%</td><td>${l.lat.toFixed(4)},${l.lon.toFixed(4)}</td></tr>`).join('');
+}
+let tick=0; setInterval(update, 1000);
+</script>
+</body>
+</html>
+)rawliteral";
+
+/* ================= HELPERS ================= */
+float calculateDrift(double lat1, double lon1, double lat2, double lon2) {
+  if (lat1 == 0) return 0;
+  double dLat = radians(lat2 - lat1), dLon = radians(lon2 - lon1);
+  double a = sin(dLat/2)*sin(dLat/2) + cos(radians(lat1))*cos(radians(lat2))*sin(dLon/2)*sin(dLon/2);
+  return 6371000 * 2 * atan2(sqrt(a), sqrt(1-a));
+}
+
+void updateEWMA(float value, float alpha, float &mean, float &variance) {
+  float delta = value - mean;
+  mean += alpha * delta;
+  variance = (1.0 - alpha) * (variance + alpha * delta * delta);
+  if (variance < 0.0001) variance = 0.0001;
+}
+
+void kalmanUpdate(double mLat, double mLon, float dt) {
+  if(!kalmanInitialized) { kfLat=mLat; kfLon=mLon; kalmanInitialized=true; return; }
+  kfLat += kfVLat * dt; kfLon += kfVLon * dt;
+  double eLat = mLat - kfLat, eLon = mLon - kfLon;
+  kfLat += 0.22 * eLat; kfLon += 0.22 * eLon;
+  if(dt > 0.01) { kfVLat += 0.08 * (eLat/dt); kfVLon += 0.08 * (eLon/dt); }
+}
+
+void appendAttackLog(String type) {
+  unsigned long now = millis();
+  if (type == lastLoggedAttack && (now - lastAttackLogMs) < 5000) return;
+  int idx = (attackLogStart + attackLogCount) % MAX_ATTACK_LOGS;
+  attackLogs[idx] = {now/1000, displayLat, displayLon, antiSpoofRisk, type};
+  if (attackLogCount < MAX_ATTACK_LOGS) attackLogCount++; else attackLogStart = (attackLogStart + 1) % MAX_ATTACK_LOGS;
+  lastLoggedAttack = type; lastAttackLogMs = now;
+}
+
+void deepPurgeResync() {
+  spoofSim = false; jamSim = false; safeMode = false; stabilityGateBlocked = false;
+  spoofCounter = 0; antiSpoofRisk = 0; zAnomalyScore = 0;
+  driftMean = 8.0; driftVar = 12.0; hdopMean = 1.2; satMean = 9.0;
+  kalmanInitialized = false;
+  aiStatus = "NORMAL"; spoofReason = "System deep purged. Sensor memory reset.";
+}
+
+/* ================= SECURITY LOGIC ================= */
+void processSecurityLogic() {
+  unsigned long nowMs = millis();
+  float dt = (lastFixMs == 0) ? 1.0 : constrain((nowMs - lastFixMs) / 1000.0, 0.2, 5.0);
+  lastFixMs = nowMs;
+
+  if (!gps.location.isValid() || gps.satellites.value() < 4) {
+    aiStatus = "NO GPS LOCK"; antiSpoofRisk = 0.2; return;
+  }
+
+  currentLat = gps.location.lat(); currentLon = gps.location.lng();
+  speedKph = gps.speed.kmph(); satellites = gps.satellites.value(); hdopValue = gps.hdop.hdop();
+  
+  driftMeters = calculateDrift(lastLat, lastLon, currentLat, currentLon);
+  kalmanUpdate(currentLat, currentLon, dt);
+
+  // Feature Extraction for AI
+  float features[5] = {(float)currentLat, (float)currentLon, speedKph, satellites, hdopValue};
+  int pred = model.predict(features);
+
+  // EWMA Statistics
+  updateEWMA(driftMeters, 0.07, driftMean, driftVar);
+  float driftZ = fabs(driftMeters - driftMean) / sqrt(driftVar);
+
+  // CRITICAL FIX: Hardware Veto Logic
+  // AI Prediction (pred == 1) is only valid if Hardware quality is also low
+  bool hardwareDistress = (satellites < 6 || hdopValue > 2.5);
+  bool aiFlagsJamming = (pred == 1 && hardwareDistress);
+
+  // Stability Gate Logic
+  float gateLimit = max(35.0f, (speedKph * dt) + 20.0f);
+  stabilityGateBlocked = (driftMeters > gateLimit) || (driftMeters > 400.0);
+
+  if (stabilityGateBlocked) {
+    displayLat = lastLat; displayLon = lastLon;
+    spoofReason = "Stability Gate: Impossible jump blocked.";
+    spoofCounter += 2;
+  } else {
+    displayLat = currentLat; displayLon = currentLon;
+    lastLat = currentLat; lastLon = currentLon;
+    spoofCounter = max(0, spoofCounter - 1);
+  }
+
+  antiSpoofRisk = constrain((driftZ * 0.15) + (stabilityGateBlocked ? 0.5 : 0.0), 0, 1);
+
+  if (jamSim || aiFlagsJamming) {
+    aiStatus = "JAMMING DETECTED";
+    appendAttackLog("Jamming");
+  } else if (spoofSim || spoofCounter > 4) {
+    aiStatus = "SPOOF DETECTED";
+    appendAttackLog("Spoofing");
+  } else {
+    aiStatus = "NORMAL";
+    spoofReason = "Signal normal.";
+  }
+
+  trustScore = constrain((satellites / 12.0) * (1.0 - antiSpoofRisk), 0, 1);
+}
+
+/* ================= WEB HANDLERS ================= */
+void handleStatus() {
+  StaticJsonDocument<400> doc;
+  doc["lat"] = displayLat; doc["lon"] = displayLon; doc["status"] = aiStatus;
+  doc["sat"] = satellites; doc["hdop"] = hdopValue; doc["drift"] = driftMeters;
+  doc["trust"] = trustScore; doc["speed"] = speedKph; doc["risk"] = antiSpoofRisk;
+  doc["gate"] = stabilityGateBlocked; doc["reason"] = spoofReason;
+  String j; serializeJson(doc, j); server.send(200, "application/json", j);
+}
+
+void handleLogs() {
+  StaticJsonDocument<1500> doc; JsonArray l = doc.createNestedArray("logs");
+  for (int i=0; i<attackLogCount; i++) {
+    int idx = (attackLogStart + i) % MAX_ATTACK_LOGS;
+    JsonObject r = l.createNestedObject();
+    r["time"] = attackLogs[idx].sec; r["lat"] = attackLogs[idx].lat;
+    r["attack"] = attackLogs[idx].attack; r["risk"] = attackLogs[idx].risk;
+  }
+  String j; serializeJson(doc, j); server.send(200, "application/json", j);
+}
+
+void setup() {
+  Serial.begin(115200);
+  gpsSerial.begin(9600, SERIAL_8N1, 16, 17);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
+  server.on("/", [](){ server.send(200, "text/html", index_html); });
+  server.on("/status", handleStatus);
+  server.on("/logs", handleLogs);
+  server.on("/spoof", [](){ spoofSim=true; server.send(200); });
+  server.on("/jam", [](){ jamSim=true; server.send(200); });
+  server.on("/reset", [](){ deepPurgeResync(); server.send(200); });
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
+  if (gps.location.isUpdated()) processSecurityLogic();
+}
